@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Data, results, logs (generated at runtime — too large for git)
+data/
+logs/
+results/
+
+# Trained models / optimiser artefacts
+models/saved/
+catboost_info/
+models/catboost_info/
+
+# Generated path/network JSON (built by build_path.py)
+circuit_path.json
+road_network.json
+
+# Sweep logs
+*.log
+
+# Claude Code session data
+.claude/
+
+# IDE
+.idea/
+*.iml
+Dissertation.iml
+
+# OS
+.DS_Store
+Thumbs.db
