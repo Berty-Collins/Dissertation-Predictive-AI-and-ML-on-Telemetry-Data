@@ -339,7 +339,7 @@ def run_chronos(X_train, X_test, y_train, y_test, target) -> Tuple[dict, np.ndar
 # =============================================================================
 def run_autogluon(X_train, X_test, y_train, y_test,
                   feature_names, target) -> Tuple[dict, np.ndarray]:
-    import tempfile, os
+    import tempfile, shutil
     log.info("  [AutoGluon] fitting (time_limit=300s)...")
     gpu = _has_gpu()
 
@@ -348,7 +348,15 @@ def run_autogluon(X_train, X_test, y_train, y_test,
     df_train["__target__"] = y_train
     df_test  = pd.DataFrame(X_test,  columns=feature_names)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    # Use mkdtemp + explicit shutil.rmtree rather than TemporaryDirectory.
+    # On Windows, AutoGluon holds model file handles open after fit() returns,
+    # causing TemporaryDirectory.__exit__ cleanup to silently fail.  The
+    # leftover directory is then detected by the NEXT target's TabularPredictor
+    # as an already-fitted model, triggering "Learner is already fit."
+    # mkdtemp gives a guaranteed-unique path; ignore_errors=True in rmtree
+    # handles any still-locked files gracefully.
+    tmpdir = tempfile.mkdtemp(prefix=f"ag_{target[:12]}_")
+    try:
         predictor = TabularPredictor(
             label="__target__",
             path=tmpdir,
@@ -360,30 +368,35 @@ def run_autogluon(X_train, X_test, y_train, y_test,
             time_limit=300,
             presets="best_quality",
             num_gpus=1 if gpu else 0,
-            # Exclude FastAI — requires a separate optional install and adds
-            # little over the existing neural net models already included.
             excluded_model_types=["FASTAI"],
         )
-        y_pred    = predictor.predict(df_test).values
-        lb        = predictor.leaderboard(df_train, silent=True)
+        y_pred = predictor.predict(df_test).values
+        lb     = predictor.leaderboard(df_train, silent=True)
         log.info("  [AutoGluon] leaderboard:\n%s", lb[["model","score_val"]].to_string())
 
-        # 5-fold CV on training set using best model
+        # 5-fold CV — each fold gets its own fresh temp directory
         kf = KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
         cv_scores = []
-        for fold,(ti,vi) in enumerate(kf.split(X_train)):
-            dtr = pd.DataFrame(X_train[ti],columns=feature_names)
+        for fold, (ti, vi) in enumerate(kf.split(X_train)):
+            dtr = pd.DataFrame(X_train[ti], columns=feature_names)
             dtr["__target__"] = y_train[ti]
-            dva = pd.DataFrame(X_train[vi],columns=feature_names)
-            p_cv = TabularPredictor(
-                label="__target__", path=os.path.join(tmpdir,f"cv{fold}"),
-                problem_type="regression", eval_metric="r2", verbosity=0,
-            ).fit(dtr, time_limit=60, presets="medium_quality",
-                  num_gpus=1 if gpu else 0, excluded_model_types=["FASTAI"])
-            cv_scores.append(r2_score(y_train[vi], p_cv.predict(dva).values))
-            log.info("    fold %d/%d  R2=%.4f",fold+1,CV_FOLDS,cv_scores[-1])
+            dva = pd.DataFrame(X_train[vi], columns=feature_names)
+            cv_path = tempfile.mkdtemp(prefix=f"ag_{target[:8]}_cv{fold}_")
+            try:
+                p_cv = TabularPredictor(
+                    label="__target__", path=cv_path,
+                    problem_type="regression", eval_metric="r2", verbosity=0,
+                ).fit(dtr, time_limit=60, presets="medium_quality",
+                      num_gpus=1 if gpu else 0, excluded_model_types=["FASTAI"])
+                cv_scores.append(r2_score(y_train[vi], p_cv.predict(dva).values))
+            finally:
+                shutil.rmtree(cv_path, ignore_errors=True)
+            log.info("    fold %d/%d  R2=%.4f", fold+1, CV_FOLDS, cv_scores[-1])
 
-    return _compute_metrics("AutoGluon",target,y_test,y_pred,
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return _compute_metrics("AutoGluon", target, y_test, y_pred,
                             np.array(cv_scores)), y_pred
 
 
