@@ -16,19 +16,48 @@ Running each target in its own subprocess guarantees:
   2. All file locks are released on subprocess exit (OS process termination).
   3. The parent can successfully shutil.rmtree the tmpdir after the child exits.
 
+WHY A PROJECT-LOCAL TEMP DIR?
+------------------------------
+tempfile.mkdtemp() places directories in the OS temp folder, typically on C:.
+This project lives on P:.  AutoGluon's DyStack sub-fit calls
+os.path.relpath(path, start) with path on P: and start on C:, which raises:
+    ValueError: path is on mount 'P:', start on mount 'C:'
+That exception corrupts the learner's internal state, which then triggers
+the "Learner is already fit" AssertionError in the outer fit() call.
+
+Fix: use a temp base inside the project tree (results/ag_tmp/) so all
+AutoGluon paths are on the same drive.
+
 Usage (internal — do not call directly):
     python _ag_worker.py <input.pkl> <output.pkl>
 """
 
 import pickle
 import sys
-import tempfile
 import traceback
+import uuid
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from sklearn.metrics import r2_score
 from sklearn.model_selection import KFold
+
+# All AutoGluon artefacts go under results/ag_tmp/ — same drive as project.
+# os.path.relpath() inside AutoGluon's DyStack only works within one drive.
+_WORKER_DIR = Path(__file__).resolve().parent        # .../models/
+_AG_TMP_BASE = _WORKER_DIR.parent / "results" / "ag_tmp"
+
+
+def _ag_path(prefix: str) -> str:
+    """Return a unique path string inside _AG_TMP_BASE (directory not created yet).
+
+    We intentionally do NOT pre-create the directory.  AutoGluon creates it
+    on fit(); passing a non-existent path prevents any stale-state detection
+    that triggers 'Learner is already fit'.
+    """
+    _AG_TMP_BASE.mkdir(parents=True, exist_ok=True)
+    return str(_AG_TMP_BASE / f"{prefix}_{uuid.uuid4().hex[:12]}")
 
 
 def main() -> None:
@@ -64,7 +93,7 @@ def main() -> None:
     # ── Main fit ──────────────────────────────────────────────────────────────
     # eval_metric="rmse" avoids "R2 is not implemented on GPU" from CatBoost.
     # Our caller computes the actual R² from y_pred vs y_test after the fact.
-    tmpdir = tempfile.mkdtemp(prefix=f"ag_{target[:12]}_")
+    tmpdir = _ag_path(f"ag_{target[:16]}")
     predictor = TabularPredictor(
         label="__target__",
         path=tmpdir,
@@ -89,7 +118,7 @@ def main() -> None:
         dtr["__target__"] = y_train[ti]
         dva = pd.DataFrame(X_train[vi], columns=feature_names)
 
-        cv_path = tempfile.mkdtemp(prefix=f"ag_{target[:8]}_cv{fold}_")
+        cv_path = _ag_path(f"ag_{target[:8]}_cv{fold}")
         cv_dirs.append(cv_path)
 
         p_cv = TabularPredictor(

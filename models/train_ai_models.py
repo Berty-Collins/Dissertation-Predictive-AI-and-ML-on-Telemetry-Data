@@ -384,12 +384,17 @@ def run_autogluon(X_train, X_test, y_train, y_test,
     "R2 is not implemented on GPU" warning.  Our R² is computed here from
     raw predictions after the subprocess returns.
     """
-    import tempfile, shutil, pickle, subprocess
+    import shutil, pickle, subprocess, uuid
     log.info("  [AutoGluon] fitting via subprocess (time_limit=300s)...")
     gpu = _has_gpu()
 
-    in_pkl  = tempfile.mktemp(suffix=".pkl", prefix="ag_in_")
-    out_pkl = tempfile.mktemp(suffix=".pkl", prefix="ag_out_")
+    # Keep IPC pickle files on P: (project drive) so all paths stay on the
+    # same mount and AutoGluon's relpath calls don't cross drive letters.
+    _ag_ipc = RESULTS_DIR / "ag_tmp"
+    _ag_ipc.mkdir(parents=True, exist_ok=True)
+    _uid = uuid.uuid4().hex[:10]
+    in_pkl  = str(_ag_ipc / f"ag_in_{target[:12]}_{_uid}.pkl")
+    out_pkl = str(_ag_ipc / f"ag_out_{target[:12]}_{_uid}.pkl")
 
     with open(in_pkl, "wb") as fh:
         pickle.dump({
