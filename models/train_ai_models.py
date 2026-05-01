@@ -161,6 +161,9 @@ def _tabnet_kwargs(gpu: bool) -> dict:
     ReduceLROnPlateau requires scheduler.step(metrics) but pytorch_tabnet
     calls scheduler.step() with no argument — use StepLR instead, which
     steps unconditionally every `step_size` epochs.
+
+    StepLR step_size=100 matches the ~1000-epoch final training budget so
+    the LR decays twice over the full run (at epoch 100 and 200).
     """
     import torch
     return dict(
@@ -169,12 +172,38 @@ def _tabnet_kwargs(gpu: bool) -> dict:
         optimizer_fn=torch.optim.Adam,
         optimizer_params={"lr": 2e-3, "weight_decay": 1e-5},
         scheduler_fn=torch.optim.lr_scheduler.StepLR,
-        scheduler_params={"step_size": 50, "gamma": 0.5},
+        scheduler_params={"step_size": 100, "gamma": 0.5},
         mask_type="entmax",
         device_name="cuda" if gpu else "cpu",
         verbose=0,
         seed=RANDOM_STATE,
     )
+
+
+def _tabnet_fit(model, X_tr, y_tr, X_va, y_va, max_epochs, patience, n_train):
+    """Wrapper that suppresses TabNet's stdout 'ran out of epochs' print.
+
+    pytorch_tabnet prints "Stop training because of max epochs limit reached."
+    even when verbose=0 in some package versions.  Redirecting stdout during
+    fit() eliminates the noise while keeping our own logging intact.
+
+    Batch sizes are tuned for small datasets: with only ~330 training rows,
+    batch_size=256 gives only 1-2 gradient steps per epoch.  Using n//4
+    gives ~8 steps/epoch which is enough for meaningful gradient updates.
+    """
+    import io, contextlib
+    bs  = max(32, min(128, n_train // 4))
+    vbs = max(16, bs // 2)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        model.fit(
+            X_tr, y_tr,
+            eval_set=[(X_va, y_va)],
+            max_epochs=max_epochs,
+            patience=patience,
+            batch_size=bs,
+            virtual_batch_size=vbs,
+        )
 
 
 def run_tabnet(X_train, X_test, y_train, y_test, target) -> Tuple[dict, np.ndarray]:
@@ -184,12 +213,11 @@ def run_tabnet(X_train, X_test, y_train, y_test, target) -> Tuple[dict, np.ndarr
     cv_scores = []
     for fold,(ti,vi) in enumerate(kf.split(X_train)):
         m = TabNetRegressor(**_tabnet_kwargs(gpu))
-        m.fit(
-            X_train[ti], y_train[ti].reshape(-1,1),
-            eval_set=[(X_train[vi], y_train[vi].reshape(-1,1))],
-            max_epochs=200, patience=20,
-            batch_size=min(256,len(ti)),
-            virtual_batch_size=min(128,len(ti)//2),
+        _tabnet_fit(
+            m,
+            X_train[ti], y_train[ti].reshape(-1, 1),
+            X_train[vi], y_train[vi].reshape(-1, 1),
+            max_epochs=500, patience=50, n_train=len(ti),
         )
         pv = m.predict(X_train[vi]).flatten()
         cv_scores.append(r2_score(y_train[vi], pv))
@@ -197,12 +225,11 @@ def run_tabnet(X_train, X_test, y_train, y_test, target) -> Tuple[dict, np.ndarr
 
     log.info("  [TabNet] final fit...")
     model = TabNetRegressor(**_tabnet_kwargs(gpu))
-    model.fit(
-        X_train, y_train.reshape(-1,1),
-        eval_set=[(X_test, y_test.reshape(-1,1))],
-        max_epochs=300, patience=30,
-        batch_size=min(256,len(X_train)),
-        virtual_batch_size=min(128,len(X_train)//2),
+    _tabnet_fit(
+        model,
+        X_train, y_train.reshape(-1, 1),
+        X_test,  y_test.reshape(-1, 1),
+        max_epochs=1000, patience=100, n_train=len(X_train),
     )
     y_pred = model.predict(X_test).flatten()
     save_path = str(MODELS_DIR/f"tabnet_{target}")
