@@ -362,69 +362,76 @@ def run_chronos(X_train, X_test, y_train, y_test, target) -> Tuple[dict, np.ndar
 
 
 # =============================================================================
-# 5. AutoGluon
+# 5. AutoGluon  (subprocess isolation)
 # =============================================================================
 def run_autogluon(X_train, X_test, y_train, y_test,
                   feature_names, target) -> Tuple[dict, np.ndarray]:
-    import tempfile, shutil
-    log.info("  [AutoGluon] fitting (time_limit=300s)...")
+    """Run AutoGluon in a subprocess for complete process isolation on Windows.
+
+    AutoGluon's worker threads hold OS-level file locks on model artefacts
+    even after predictor.fit() returns, preventing shutil.rmtree from
+    cleaning up the temporary directory.  The leftover fitted model is then
+    detected by the *next* target's TabularPredictor, raising:
+        AssertionError: Learner is already fit.
+
+    Running each target in _ag_worker.py (a fresh Python subprocess) means:
+      1. No shared AutoGluon module-level globals between targets.
+      2. All OS file locks are released on subprocess exit.
+      3. This parent process can successfully rmtree the tmpdirs after the
+         child has terminated.
+
+    eval_metric="rmse" is used inside the worker to avoid CatBoost's
+    "R2 is not implemented on GPU" warning.  Our R² is computed here from
+    raw predictions after the subprocess returns.
+    """
+    import tempfile, shutil, pickle, subprocess
+    log.info("  [AutoGluon] fitting via subprocess (time_limit=300s)...")
     gpu = _has_gpu()
 
-    # AutoGluon expects DataFrames
-    df_train = pd.DataFrame(X_train, columns=feature_names)
-    df_train["__target__"] = y_train
-    df_test  = pd.DataFrame(X_test,  columns=feature_names)
+    in_pkl  = tempfile.mktemp(suffix=".pkl", prefix="ag_in_")
+    out_pkl = tempfile.mktemp(suffix=".pkl", prefix="ag_out_")
 
-    # Use mkdtemp + explicit shutil.rmtree rather than TemporaryDirectory.
-    # On Windows, AutoGluon holds model file handles open after fit() returns,
-    # causing TemporaryDirectory.__exit__ cleanup to silently fail.  The
-    # leftover directory is then detected by the NEXT target's TabularPredictor
-    # as an already-fitted model, triggering "Learner is already fit."
-    # mkdtemp gives a guaranteed-unique path; ignore_errors=True in rmtree
-    # handles any still-locked files gracefully.
-    tmpdir = tempfile.mkdtemp(prefix=f"ag_{target[:12]}_")
+    with open(in_pkl, "wb") as fh:
+        pickle.dump({
+            "X_train":      X_train,
+            "X_test":       X_test,
+            "y_train":      y_train,
+            "feature_names": feature_names,
+            "target":       target,
+            "gpu":          gpu,
+            "cv_folds":     CV_FOLDS,
+            "random_state": RANDOM_STATE,
+        }, fh)
+
+    worker = str(Path(__file__).parent / "_ag_worker.py")
     try:
-        predictor = TabularPredictor(
-            label="__target__",
-            path=tmpdir,
-            problem_type="regression",
-            eval_metric="r2",
-            verbosity=1,
-        ).fit(
-            df_train,
-            time_limit=300,
-            presets="best_quality",
-            num_gpus=1 if gpu else 0,
-            excluded_model_types=["FASTAI"],
+        proc = subprocess.run(
+            [sys.executable, worker, in_pkl, out_pkl],
+            timeout=900,      # 5 min main fit + 5 × 1 min CV + headroom
         )
-        y_pred = predictor.predict(df_test).values
-        lb     = predictor.leaderboard(df_train, silent=True)
-        log.info("  [AutoGluon] leaderboard:\n%s", lb[["model","score_val"]].to_string())
-
-        # 5-fold CV — each fold gets its own fresh temp directory
-        kf = KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
-        cv_scores = []
-        for fold, (ti, vi) in enumerate(kf.split(X_train)):
-            dtr = pd.DataFrame(X_train[ti], columns=feature_names)
-            dtr["__target__"] = y_train[ti]
-            dva = pd.DataFrame(X_train[vi], columns=feature_names)
-            cv_path = tempfile.mkdtemp(prefix=f"ag_{target[:8]}_cv{fold}_")
-            try:
-                p_cv = TabularPredictor(
-                    label="__target__", path=cv_path,
-                    problem_type="regression", eval_metric="r2", verbosity=0,
-                ).fit(dtr, time_limit=60, presets="medium_quality",
-                      num_gpus=1 if gpu else 0, excluded_model_types=["FASTAI"])
-                cv_scores.append(r2_score(y_train[vi], p_cv.predict(dva).values))
-            finally:
-                shutil.rmtree(cv_path, ignore_errors=True)
-            log.info("    fold %d/%d  R2=%.4f", fold+1, CV_FOLDS, cv_scores[-1])
-
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"AutoGluon subprocess exited with code {proc.returncode} "
+                f"for target '{target}'"
+            )
+        with open(out_pkl, "rb") as fh:
+            out = pickle.load(fh)
     finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        for p in (in_pkl, out_pkl):
+            try:
+                Path(p).unlink(missing_ok=True)
+            except Exception:
+                pass
 
-    return _compute_metrics("AutoGluon", target, y_test, y_pred,
-                            np.array(cv_scores)), y_pred
+    y_pred    = np.asarray(out["y_pred"],    dtype=float)
+    cv_scores = np.asarray(out["cv_scores"], dtype=float)
+
+    # Subprocess has exited → OS file locks released → rmtree now succeeds
+    for d in ([out.get("tmpdir")] + out.get("cv_dirs", [])):
+        if d:
+            shutil.rmtree(d, ignore_errors=True)
+
+    return _compute_metrics("AutoGluon", target, y_test, y_pred, cv_scores), y_pred
 
 
 # =============================================================================
