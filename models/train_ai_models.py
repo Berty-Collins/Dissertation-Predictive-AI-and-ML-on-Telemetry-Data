@@ -155,25 +155,35 @@ def run_tabpfn(X_train, X_test, y_train, y_test, target) -> Tuple[dict, np.ndarr
 # =============================================================================
 # 2. TabNet
 # =============================================================================
-def run_tabnet(X_train, X_test, y_train, y_test, target) -> Tuple[dict, np.ndarray]:
+def _tabnet_kwargs(gpu: bool) -> dict:
+    """Shared TabNetRegressor kwargs.
+
+    ReduceLROnPlateau requires scheduler.step(metrics) but pytorch_tabnet
+    calls scheduler.step() with no argument — use StepLR instead, which
+    steps unconditionally every `step_size` epochs.
+    """
     import torch
+    return dict(
+        n_d=32, n_a=32, n_steps=5, gamma=1.5,
+        n_independent=2, n_shared=2,
+        optimizer_fn=torch.optim.Adam,
+        optimizer_params={"lr": 2e-3, "weight_decay": 1e-5},
+        scheduler_fn=torch.optim.lr_scheduler.StepLR,
+        scheduler_params={"step_size": 50, "gamma": 0.5},
+        mask_type="entmax",
+        device_name="cuda" if gpu else "cpu",
+        verbose=0,
+        seed=RANDOM_STATE,
+    )
+
+
+def run_tabnet(X_train, X_test, y_train, y_test, target) -> Tuple[dict, np.ndarray]:
     gpu = _has_gpu()
     log.info("  [TabNet] 5-fold CV...")
     kf = KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
     cv_scores = []
     for fold,(ti,vi) in enumerate(kf.split(X_train)):
-        m = TabNetRegressor(
-            n_d=32, n_a=32, n_steps=5, gamma=1.5,
-            n_independent=2, n_shared=2,
-            optimizer_fn=torch.optim.Adam,
-            optimizer_params={"lr": 2e-3, "weight_decay": 1e-5},
-            scheduler_params={"mode": "min", "patience": 5, "factor": 0.5},
-            scheduler_fn=torch.optim.lr_scheduler.ReduceLROnPlateau,
-            mask_type="entmax",
-            device_name="cuda" if gpu else "cpu",
-            verbose=0,
-            seed=RANDOM_STATE,
-        )
+        m = TabNetRegressor(**_tabnet_kwargs(gpu))
         m.fit(
             X_train[ti], y_train[ti].reshape(-1,1),
             eval_set=[(X_train[vi], y_train[vi].reshape(-1,1))],
@@ -186,18 +196,7 @@ def run_tabnet(X_train, X_test, y_train, y_test, target) -> Tuple[dict, np.ndarr
         log.info("    fold %d/%d  R2=%.4f", fold+1, CV_FOLDS, cv_scores[-1])
 
     log.info("  [TabNet] final fit...")
-    model = TabNetRegressor(
-        n_d=32, n_a=32, n_steps=5, gamma=1.5,
-        n_independent=2, n_shared=2,
-        optimizer_fn=torch.optim.Adam,
-        optimizer_params={"lr": 2e-3, "weight_decay": 1e-5},
-        scheduler_params={"mode": "min", "patience": 5, "factor": 0.5},
-        scheduler_fn=torch.optim.lr_scheduler.ReduceLROnPlateau,
-        mask_type="entmax",
-        device_name="cuda" if gpu else "cpu",
-        verbose=0,
-        seed=RANDOM_STATE,
-    )
+    model = TabNetRegressor(**_tabnet_kwargs(gpu))
     model.fit(
         X_train, y_train.reshape(-1,1),
         eval_set=[(X_test, y_test.reshape(-1,1))],
