@@ -134,9 +134,12 @@ def build_models(gpu: bool) -> Dict:
         models["LightGBM"] = lgb.LGBMRegressor(**lgb_p)
 
     if HAS_CAT:
+        # R2 is not implemented on GPU in CatBoost — use RMSE as the eval
+        # metric so the GPU is used end-to-end without a CPU metric fallback.
         models["CatBoost"] = cb.CatBoostRegressor(
             iterations=300, learning_rate=0.05, depth=5, l2_leaf_reg=3.0,
             task_type="GPU" if gpu else "CPU",
+            eval_metric="RMSE",
             random_seed=RANDOM_STATE, verbose=False,
         )
 

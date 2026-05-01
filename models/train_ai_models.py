@@ -361,6 +361,9 @@ def run_autogluon(X_train, X_test, y_train, y_test,
             time_limit=300,
             presets="best_quality",
             num_gpus=1 if gpu else 0,
+            # Exclude FastAI — requires a separate optional install and adds
+            # little over the existing neural net models already included.
+            excluded_model_types=["FASTAI"],
         )
         y_pred    = predictor.predict(df_test).values
         lb        = predictor.leaderboard(df_train, silent=True)
@@ -376,7 +379,8 @@ def run_autogluon(X_train, X_test, y_train, y_test,
             p_cv = TabularPredictor(
                 label="__target__", path=os.path.join(tmpdir,f"cv{fold}"),
                 problem_type="regression", eval_metric="r2", verbosity=0,
-            ).fit(dtr, time_limit=60, presets="medium_quality", num_gpus=1 if gpu else 0)
+            ).fit(dtr, time_limit=60, presets="medium_quality",
+                  num_gpus=1 if gpu else 0, excluded_model_types=["FASTAI"])
             cv_scores.append(r2_score(y_train[vi], p_cv.predict(dva).values))
             log.info("    fold %d/%d  R2=%.4f",fold+1,CV_FOLDS,cv_scores[-1])
 
