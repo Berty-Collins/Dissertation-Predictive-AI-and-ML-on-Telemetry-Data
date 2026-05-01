@@ -36,6 +36,8 @@ import pickle
 import sys
 import traceback
 import uuid
+import warnings
+warnings.filterwarnings("ignore")   # suppress sklearn/AutoGluon deprecation noise
 from pathlib import Path
 
 import numpy as np
